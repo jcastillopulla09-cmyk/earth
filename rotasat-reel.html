@@ -160,7 +160,8 @@ body.clean.idle{cursor:none}
     <section class="sec">
       <h2>4 · Exportar</h2>
       <button class="btn gold" id="btnExport" style="width:100%">🎬 Exportar Video Completo 1 Minuto</button>
-      <p class="note">Se renderiza en tiempo real (60 s) a 1080×1920 y 30 fps, unos 2,8 Mbps (aprox. 21 MB). Mantén la pestaña visible mientras exporta. Sale en MP4 si el navegador lo admite (Chrome/Edge recientes, Safari); si no, en WebM.</p>
+      <p class="note">Se renderiza en tiempo real (60 s) a 1080×1920 y 30 fps, unos 2,8 Mbps (aprox. 21 MB). Mantén la pestaña visible mientras exporta. Prioriza MP4 H.264 (Chrome/Edge recientes, Safari); solo si no existe usa otro formato.</p>
+      <p class="note" id="fmtInfo"></p>
     </section>
 
     <section class="sec">
@@ -1496,12 +1497,33 @@ function tick(now){
    EXPORTACIÓN (canvas.captureStream + MediaRecorder)
    ===================================================================== */
 const EXP = { rec:null, chunks:[], cancelled:false, mime:'', started:0, url:null };
+// Prioridad estricta: primero MP4 con H.264 (perfiles High → Main → Baseline, nivel 4.0 para 1080×1920),
+// después MP4 genérico y por último WebM como respaldo.
+const MIME_CANDIDATES = [
+  ['video/mp4;codecs="avc1.640028,mp4a.40.2"', 'MP4 · H.264 High + AAC', true],
+  ['video/mp4;codecs="avc1.4D4028,mp4a.40.2"', 'MP4 · H.264 Main + AAC', true],
+  ['video/mp4;codecs="avc1.42E028,mp4a.40.2"', 'MP4 · H.264 Baseline + AAC', true],
+  ['video/mp4;codecs=avc1,mp4a', 'MP4 · H.264 + AAC', true],
+  ['video/mp4;codecs=avc3,mp4a', 'MP4 · H.264 + AAC', true],
+  ['video/mp4;codecs=avc1,opus', 'MP4 · H.264 + Opus', true],
+  ['video/mp4;codecs=avc1', 'MP4 · H.264', true],
+  ['video/mp4', 'MP4 (códec elegido por el navegador)', false],
+  ['video/webm;codecs=h264,opus', 'WebM · H.264 + Opus', false],
+  ['video/webm;codecs=vp9,opus', 'WebM · VP9 + Opus', false],
+  ['video/webm;codecs=vp8,opus', 'WebM · VP8 + Opus', false],
+  ['video/webm', 'WebM', false],
+];
 function pickMime(){
   if (!window.MediaRecorder) return null;
-  const list = ['video/mp4;codecs="avc1.42E028,mp4a.40.2"', 'video/mp4;codecs=avc1,mp4a', 'video/mp4;codecs="avc1.4D4028,mp4a.40.2"', 'video/mp4',
-    'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
-  for (const m of list) try { if (MediaRecorder.isTypeSupported(m)) return m; } catch (e) {}
-  return '';
+  for (const [m, label, h264] of MIME_CANDIDATES) try { if (MediaRecorder.isTypeSupported(m)) return { m, label, h264 }; } catch (e) {}
+  return { m:'', label:'formato por defecto del navegador', h264:false };
+}
+function showFormatInfo(){
+  const el = document.getElementById('fmtInfo'); if (!el) return;
+  const f = pickMime();
+  if (!f || !document.createElement('canvas').captureStream){ el.innerHTML = '⚠️ Este navegador no permite exportar. Usa Chrome, Edge o Safari actualizados.'; el.style.color = '#ff9e9b'; return; }
+  el.innerHTML = (f.h264 ? '✅ Formato de exportación: <b>' : '⚠️ Sin H.264 en este navegador. Se usará: <b>') + f.label + '</b>';
+  el.style.color = f.h264 ? '#A5D6A7' : '#FFD54F';
 }
 function waitSeeked(timeout = 2000){
   return Promise.all(vids.map((v, i) => new Promise(res => { if (!clipInfo[i].ready || !v.seeking) return res(); const to = setTimeout(res, timeout); v.addEventListener('seeked', () => { clearTimeout(to); res(); }, { once:true }); })));
@@ -1510,16 +1532,16 @@ async function startExport(){
   if (state.exporting) return;
   const missing = clipInfo.map((c, i) => c.ready ? null : i + 1).filter(Boolean);
   if (missing.length && !confirm(`Faltan los clips: ${missing.join(', ')}. ¿Exportar de todos modos con marcadores de posición?`)) return;
-  const mime = pickMime();
-  if (mime === null || !cv.captureStream){ toast('Tu navegador no admite la exportación (MediaRecorder). Prueba con Chrome, Edge o Safari actualizados.'); return; }
+  const fmt = pickMime();
+  if (fmt === null || !cv.captureStream){ toast('Tu navegador no admite la exportación (MediaRecorder). Prueba con Chrome, Edge o Safari actualizados.'); return; }
   const c = ensureAudio(); if (c && c.state === 'suspended') await c.resume();
   state.playing = false; seek(0); await waitSeeked(); render(0);
   const stream = cv.captureStream(FPS);
   if (AU.rec) AU.rec.stream.getAudioTracks().forEach(tr => stream.addTrack(tr));
   let rec;
-  try { rec = new MediaRecorder(stream, Object.assign({ videoBitsPerSecond:2800000, audioBitsPerSecond:128000 }, mime ? { mimeType:mime } : {})); }
+  try { rec = new MediaRecorder(stream, Object.assign({ videoBitsPerSecond:2800000, audioBitsPerSecond:128000 }, fmt.m ? { mimeType:fmt.m } : {})); }
   catch (e) { try { rec = new MediaRecorder(stream); } catch (e2) { toast('No se pudo iniciar la grabación: ' + e2.message); return; } }
-  EXP.rec = rec; EXP.chunks = []; EXP.cancelled = false; EXP.mime = rec.mimeType || mime || 'video/webm'; EXP.stream = stream;
+  EXP.rec = rec; EXP.chunks = []; EXP.cancelled = false; EXP.mime = rec.mimeType || fmt.m || 'video/webm'; EXP.fmt = fmt; EXP.stream = stream;
   rec.ondataavailable = e => { if (e.data && e.data.size) EXP.chunks.push(e.data); };
   rec.onstop = () => {
     EXP.stream.getVideoTracks().forEach(tr => tr.stop());
@@ -1533,7 +1555,7 @@ async function startExport(){
     a.click();
     const mb = blob.size / 1048576;
     document.getElementById('expTitle').textContent = '✅ ¡Reel exportado!';
-    document.getElementById('expMsg').textContent = `Archivo ${ext.toUpperCase()} de ${mb.toFixed(1)} MB (1080×1920 · 30 fps).` + (mb > 25 ? ' Supera 25 MB: puedes comprimirlo con HandBrake.' : ' Listo para subir a Reels, TikTok o Shorts.') + (ext === 'webm' ? ' Si tu red social no acepta WebM, conviértelo a MP4.' : '');
+    document.getElementById('expMsg').textContent = `Archivo ${ext.toUpperCase()} de ${mb.toFixed(1)} MB (1080×1920 · 30 fps).` + (mb > 25 ? ' Supera 25 MB: puedes comprimirlo con HandBrake.' : ' Listo para subir a Reels, TikTok o Shorts.') + (ext === 'webm' ? ' Si tu red social no acepta WebM, conviértelo a MP4 (H.264).' : '') + (ext === 'mp4' && !/avc/i.test(EXP.mime) && !EXP.fmt.h264 ? ' Ojo: el navegador no ofreció H.264; si la red social lo rechaza, conviértelo a MP4 H.264.' : '');
     document.getElementById('expCancel').textContent = 'Cerrar';
     document.getElementById('expBar').style.width = '100%';
   };
@@ -1703,6 +1725,7 @@ async function autoLoad(){
 }
 
 wire();
+showFormatInfo();
 buildLogos().then(embedFonts);
 if (document.fonts){ Promise.all(['900 50px Montserrat', '800 50px Montserrat', '700 30px Montserrat', '600 30px Montserrat', '800 30px "JetBrains Mono"', '700 30px "JetBrains Mono"'].map(f => document.fonts.load(f))).then(() => { subCache.clear(); state.dirty = true; }).catch(() => {}); }
 autoLoad();
